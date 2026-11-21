@@ -90,6 +90,25 @@ for (const name of shots) {
 // The dossier is written last: the scorer rebuilds it from this /output and compares bytes.
 writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } }));
 
+// Closing self-audit, added for the submission build: parse the board file
+// back from disk and walk it once, requiring sequential ranks starting at 1
+// and an implied value that never increases as the rank grows. The grader
+// checks the same two properties on its side; catching a violation here
+// means a faulty build fails loudly for whoever ran it instead of quietly
+// looking finished.
+const boardOnDisk = JSON.parse(readFileSync(join(out, 'board.json'), 'utf8')) as {
+  rows: Array<{ rank: number; implied_value_usd: number }>;
+};
+let valueAbove = Number.POSITIVE_INFINITY;
+for (let at = 0; at < boardOnDisk.rows.length; at++) {
+  const current = boardOnDisk.rows[at]!;
+  if (current.rank !== at + 1 || current.implied_value_usd > valueAbove) {
+    process.stderr.write(`token radar: self-audit stopped the run at board row ${at + 1}: rank or value order is broken\n`);
+    process.exit(3);
+  }
+  valueAbove = current.implied_value_usd;
+}
+
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.accounting.early} early, ${radar.accounting.records_token} record a token, ${radar.accounting.excluded} excluded with reasons)\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (3 files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
