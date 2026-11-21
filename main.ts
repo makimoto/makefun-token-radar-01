@@ -7,7 +7,7 @@
 //
 // The dashboard is a static page, no framework and no network: dashboard/index.html, dashboard/app.css
 // and dashboard/app.js read /output/data.js, which this program writes from the same board. The model
-// is radar-17 (lib/model.ts): auditable classification of all 758 protocols, a size curve fitted on
+// is radar-19 (lib/model.ts): auditable classification of all 758 protocols, a size curve fitted on
 // the snapshot's own peers with a shipped cross-validation, and farm plans that end in a verdict.
 //
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:

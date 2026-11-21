@@ -21,7 +21,7 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-export const MODEL_VERSION = 'radar-17';
+export const MODEL_VERSION = 'radar-19';
 /** Maximum number of eligible off-watchlist rows. */
 export const EARLY_ROWS = 160;
 /**
@@ -178,6 +178,7 @@ export interface RadarData {
   peers: PeerRow[];
   validation: Validation;
   accounting: Accounting;
+  watchlist_slugs: string[];
   rows: RadarRow[];
   live: LiveRow[];
   excluded: ExcludedRow[];
@@ -430,7 +431,7 @@ function routeFor(category: string | null): Route | null {
     case 'CDP':
     case 'CDP Manager':
       return {
-        check: 'Find an open-and-repay flow. Set collateral, the smallest supported debt and a repayment reserve within the cap. Check the oracle, minimums and interest. At those amounts, require a 30% collateral price drop to leave the position above liquidation and confirm repayment fits the budget.',
+        check: 'Find an open-and-repay flow. Set collateral, the smallest supported debt and a repayment reserve within the cap. Check the oracle, minimums and interest. At those amounts, require a 30% collateral drop to leave the position above liquidation and confirm repayment fits the budget.',
         entry: 'Set aside the checked repayment reserve. Post the checked collateral, mint the checked debt and keep it available for repayment.',
         monitor: 'Check collateral ratio and accrued interest daily. Repay early if the position fails the original stress check.',
         exit: 'Repay principal and interest, then withdraw collateral. Confirm the app shows zero debt.',
@@ -483,12 +484,24 @@ function holdDays(age: number | null): number {
   return 30;
 }
 
+// Scenario gas per transaction by chain tier. These are planning
+// assumptions, not measurements: Ethereum mainnet is the expensive tier,
+// Tron contract execution is energy-priced and sits between mainnet and
+// the near-free chains, and every other listed chain is modeled at $1.
 function gasFor(chain: string | null): number {
-  return chain === 'Ethereum' ? 5 : 1;
+  if (chain === 'Ethereum') return 5;
+  if (chain === 'Tron') return 3;
+  return 1;
 }
 
 export function farmMath(p: SnapshotProtocol, age: number | null) {
-  const chain = p.chains[0] ?? null;
+  const firstChain = p.chains[0] ?? null;
+  // The priced scenario runs on the cheapest listed chain in the modeled
+  // tiers; step 1 verifies the route is actually offered there and reprices
+  // on the first listed chain when it is not.
+  const chain = p.chains.length
+    ? p.chains.reduce((a, b) => (gasFor(b) < gasFor(a) ? b : a))
+    : null;
   const route = chain ? routeFor(p.category) : null;
   const capital = route ? capitalFor(p) : 0;
   const gas = gasFor(chain);
@@ -507,12 +520,29 @@ export function farmMath(p: SnapshotProtocol, age: number | null) {
   const burdenPct = capital ? Math.round(fees / capital * 1000) / 10 : 0;
   const verdict = !route ? 'Research' : coreFees * 100 <= capital * 8 ? 'Low gas' : 'High gas';
   const farmSize = route ? Math.ceil(coreFees * 100 / 8) : 0;
-  const altChain = route ? (p.chains.find((c) => gasFor(c) < gas) ?? null) : null;
-  const altFees = altChain ? gasFor(altChain) * coreTxs : 0;
-  const scenarioChain = p.chains.length
-    ? p.chains.reduce((a, b) => (gasFor(b) < gasFor(a) ? b : a))
-    : null;
-  return { chain, route, pilot, capital, gas, entryTxs, exitTxs, coreFees, reviewWeeks, weeklyTxs, transactions, fees, burdenPct, verdict, hold, farmSize, altChain, altFees, scenarioChain } as const;
+  const scenarioChain = chain;
+  return { chain, firstChain, route, pilot, capital, gas, entryTxs, exitTxs, coreFees, reviewWeeks, weeklyTxs, transactions, fees, burdenPct, verdict, hold, farmSize, scenarioChain } as const;
+}
+
+// Non-gas costs a reader must expect on top of modeled gas, named per
+// route family. The snapshot carries none of their sizes, so the plans
+// name them and price none of them.
+function costWatch(category: string | null): string {
+  switch (category) {
+    case 'CDP':
+    case 'CDP Manager':
+      return 'debt interest accrues while the position is open';
+    case 'Derivatives':
+      return 'funding payments and spread apply while the position is open';
+    case 'Dexs':
+      return 'slippage and impermanent loss apply beyond gas';
+    case 'RWA':
+      return 'subscription and redemption fees and identity checks apply beyond gas';
+    case 'Lending':
+      return 'utilisation can delay withdrawal even though gas is small';
+    default:
+      return 'funding, bridging, spread and protocol fees apply beyond gas where the route uses them';
+  }
 }
 
 export function stepText(step: FarmStep): string {
@@ -531,13 +561,11 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
     { text: 'Look for published rewards or points terms. Record what they say, or log that you found no published terms.', cost: '$0', time: '10 min' },
     { text: 'Log the available action, minimum and exit terms, and what evidence would upgrade this row to a costed plan. Recheck at the next weekly review.', cost: '$0', time: '5 min' },
   ];
-  const alternate = m.altChain
-    ? ` If the app confirms the same route on ${m.altChain}, its entry and exit gas scenario is $${m.altFees} (${(100 * m.altFees / m.capital).toFixed(1)}% of the same position).`
-    : '';
   const verdictText = `Verdict: ${m.verdict}. Modeled gas is $${m.fees} (${m.burdenPct}% of the $${m.capital} position) across ${m.transactions} transactions.` +
     (m.weeklyTxs ? ` Entry and exit account for $${m.coreFees}; weekly actions are optional.` : '') +
     ' Rewards are unknown.' +
-    (m.verdict === 'High gas' ? ` The 8% gas line for entry and exit on ${chain} would require $${m.farmSize}, above this plan’s position cap.${alternate}` : '');
+    (m.verdict === 'High gas' ? ` The 8% gas line for entry and exit on ${chain} would require $${m.farmSize}, above this plan’s position cap. ${chain} is already the cheapest listed chain in the modeled tiers, so no listed chain lowers it.` : '') +
+    ` Beyond gas: ${costWatch(p.category)} — the snapshot prices none of these, so verify them in the app before funding.`;
   const horizon = p.category === 'RWA' ? '7-day review, with return of funds by your verified deadline' :
     m.pilot ? `up to ${m.hold} ${m.hold === 1 ? 'day' : 'days'}` : `${m.hold} days (age-based scenario)`;
   const exitTiming = p.category === 'RWA'
@@ -549,8 +577,8 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
     ? { text: `Review participation terms weekly through week ${m.reviewWeeks} or until exit starts, whichever comes first. Sign at most once per week and ${m.weeklyTxs} times total. Confirm eligibility and room within the cap. Before signing, check whether the action would delay exit and skip it if so. Requote the action and exit. Include costs already incurred and both quotes. Skip if gas exceeds 8% of the actual position or total costs exceed your budget.`, cost: `up to $${m.gas * m.weeklyTxs} scenario gas for ${m.weeklyTxs} optional transactions`, time: '10 min a week' }
     : { text: `Keep participation checks read-only through week ${m.reviewWeeks} or until exit starts, whichever comes first. Record any published terms and eligibility.`, cost: '$0', time: '10 min a week' };
   return [
-    { text: `Verify ${p.name} lists this route on ${chain}. Set a position size within the $${m.capital} cap. ${m.route.check} Check minimums and quote entry and exit at those amounts. Stay read-only if gas exceeds 8% at that size or total costs exceed your budget.`, cost: '$0', time: '20 min' },
-    { text: `${exitTiming} Confirm official participation terms and your eligibility. Stay read-only if timing or eligibility is unverified.`, cost: '$0', time: '5 min before entry' },
+    { text: `Verify ${p.name} lists this route on ${chain}. Set a size within the $${m.capital} cap. ${m.route.check} Quote entry and exit at those amounts.${m.firstChain && m.firstChain !== chain ? ` If it is not offered there, reprice the plan on ${m.firstChain} before funding.` : ''} Stay read-only if gas exceeds 8% at that size or total costs exceed budget.`, cost: '$0', time: '20 min' },
+    { text: `${exitTiming} Confirm official participation terms and your eligibility. Confirm the wallet holds the position assets and ${chain} gas token, or price the bridge in first. Stay read-only if timing or eligibility is unverified.`, cost: '$0', time: '5 min before entry' },
     { text: `Reserve the quoted exit gas first. Use the position size checked before entry. ${m.route.entry} Save the receipts.`, cost: `up to $${m.gas * m.entryTxs} scenario gas for ${m.entryTxs} transactions incl. approvals`, time: '15 min active, plus settlement if required' },
     ...(followUp ? [followUp] : []),
     { text: `Plan window: ${horizon}. ${m.route.monitor} Recheck exit lead time each review. If it grows, pause optional actions and bring exit forward if possible. Record any rewards shown.`, cost: '$0 gas for read-only checks', time: m.pilot ? '5 min per review' : '5 min weekly' },
@@ -578,6 +606,9 @@ export function buildBoard(snapshot: Snapshot): { board: BoardRow[]; excluded: E
     .sort((a, b) => b.v.implied - a.v.implied || (a.p.slug < b.p.slug ? -1 : 1));
   for (const s of scoredAll.slice(0, EARLY_ROWS)) {
     chosen.set(s.p.slug, s.p);
+  }
+  if (snapshot.watchlist.some((slug) => !chosen.has(slug))) {
+    throw new Error('watchlist coverage failure: a watchlist slug is missing from the snapshot index');
   }
   const scored = [...chosen.values()].map((p) => ({ p, v: impliedValue(p, snapshot.as_of, fit) }));
   scored.sort((a, b) => b.v.implied - a.v.implied || (a.p.slug < b.p.slug ? -1 : 1));
@@ -684,6 +715,7 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     peers: peers.map((p) => ({ slug: p.slug, tvl_usd: p.tvl_usd, mcap_usd: p.mcap_usd!, change_7d: p.change_7d, listed_at: p.listed_at })),
     validation: validateModels(snapshot),
     accounting,
+    watchlist_slugs: [...snapshot.watchlist],
     rows: board.map((r) => ({
       rank: r.rank,
       slug: r.slug,

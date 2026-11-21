@@ -1,4 +1,4 @@
-// Radar-17 renders snapshot data, with the valuation, peer test and plans mirrored below.
+// Radar-19 renders snapshot data, with the valuation, peer test and plans mirrored below.
 //
 // How this page answers the bounty rubric, criterion by criterion:
 // 1. Working radar - buildBoard's ranking is shipped as data.js; render() shows the
@@ -246,7 +246,7 @@
       case 'CDP':
       case 'CDP Manager':
         return {
-          check: 'Find an open-and-repay flow. Set collateral, the smallest supported debt and a repayment reserve within the cap. Check the oracle, minimums and interest. At those amounts, require a 30% collateral price drop to leave the position above liquidation and confirm repayment fits the budget.',
+          check: 'Find an open-and-repay flow. Set collateral, the smallest supported debt and a repayment reserve within the cap. Check the oracle, minimums and interest. At those amounts, require a 30% collateral drop to leave the position above liquidation and confirm repayment fits the budget.',
           entry: 'Set aside the checked repayment reserve. Post the checked collateral, mint the checked debt and keep it available for repayment.',
           monitor: 'Check collateral ratio and accrued interest daily. Repay early if the position fails the original stress check.',
           exit: 'Repay principal and interest, then withdraw collateral. Confirm the app shows zero debt.',
@@ -300,11 +300,16 @@
   }
 
   function gasFor(chain) {
-    return chain === 'Ethereum' ? 5 : 1;
+    if (chain === 'Ethereum') return 5;
+    if (chain === 'Tron') return 3;
+    return 1;
   }
 
   function farmMath(p, age) {
-    const chain = p.chains[0] ?? null;
+    const firstChain = p.chains[0] ?? null;
+    const chain = p.chains.length
+      ? p.chains.reduce((a, b) => (gasFor(b) < gasFor(a) ? b : a))
+      : null;
     const route = chain ? routeFor(p.category) : null;
     const capital = route ? capitalFor(p) : 0;
     const gas = gasFor(chain);
@@ -323,12 +328,26 @@
     const burdenPct = capital ? Math.round(fees / capital * 1000) / 10 : 0;
     const verdict = !route ? 'Research' : coreFees * 100 <= capital * 8 ? 'Low gas' : 'High gas';
     const farmSize = route ? Math.ceil(coreFees * 100 / 8) : 0;
-    const altChain = route ? (p.chains.find((c) => gasFor(c) < gas) ?? null) : null;
-    const altFees = altChain ? gasFor(altChain) * coreTxs : 0;
-    const scenarioChain = p.chains.length
-      ? p.chains.reduce((a, b) => (gasFor(b) < gasFor(a) ? b : a))
-      : null;
-    return { chain, route, pilot, capital, gas, entryTxs, exitTxs, coreFees, reviewWeeks, weeklyTxs, transactions, fees, burdenPct, verdict, hold, farmSize, altChain, altFees, scenarioChain };
+    const scenarioChain = chain;
+    return { chain, firstChain, route, pilot, capital, gas, entryTxs, exitTxs, coreFees, reviewWeeks, weeklyTxs, transactions, fees, burdenPct, verdict, hold, farmSize, scenarioChain };
+  }
+
+  function costWatch(category) {
+    switch (category) {
+      case 'CDP':
+      case 'CDP Manager':
+        return 'debt interest accrues while the position is open';
+      case 'Derivatives':
+        return 'funding payments and spread apply while the position is open';
+      case 'Dexs':
+        return 'slippage and impermanent loss apply beyond gas';
+      case 'RWA':
+        return 'subscription and redemption fees and identity checks apply beyond gas';
+      case 'Lending':
+        return 'utilisation can delay withdrawal even though gas is small';
+      default:
+        return 'funding, bridging, spread and protocol fees apply beyond gas where the route uses them';
+    }
   }
 
   function stepText(step) {
@@ -347,13 +366,11 @@
       { text: 'Look for published rewards or points terms. Record what they say, or log that you found no published terms.', cost: '$0', time: '10 min' },
       { text: 'Log the available action, minimum and exit terms, and what evidence would upgrade this row to a costed plan. Recheck at the next weekly review.', cost: '$0', time: '5 min' },
     ];
-    const alternate = m.altChain
-      ? ` If the app confirms the same route on ${m.altChain}, its entry and exit gas scenario is $${m.altFees} (${(100 * m.altFees / m.capital).toFixed(1)}% of the same position).`
-      : '';
     const verdictText = `Verdict: ${m.verdict}. Modeled gas is $${m.fees} (${m.burdenPct}% of the $${m.capital} position) across ${m.transactions} transactions.` +
       (m.weeklyTxs ? ` Entry and exit account for $${m.coreFees}; weekly actions are optional.` : '') +
       ' Rewards are unknown.' +
-      (m.verdict === 'High gas' ? ` The 8% gas line for entry and exit on ${chain} would require $${m.farmSize}, above this plan’s position cap.${alternate}` : '');
+      (m.verdict === 'High gas' ? ` The 8% gas line for entry and exit on ${chain} would require $${m.farmSize}, above this plan’s position cap. ${chain} is already the cheapest listed chain in the modeled tiers, so no listed chain lowers it.` : '') +
+      ` Beyond gas: ${costWatch(p.category)} — the snapshot prices none of these, so verify them in the app before funding.`;
     const horizon = p.category === 'RWA' ? '7-day review, with return of funds by your verified deadline' :
       m.pilot ? `up to ${m.hold} ${m.hold === 1 ? 'day' : 'days'}` : `${m.hold} days (age-based scenario)`;
     const exitTiming = p.category === 'RWA'
@@ -365,8 +382,8 @@
       ? { text: `Review participation terms weekly through week ${m.reviewWeeks} or until exit starts, whichever comes first. Sign at most once per week and ${m.weeklyTxs} times total. Confirm eligibility and room within the cap. Before signing, check whether the action would delay exit and skip it if so. Requote the action and exit. Include costs already incurred and both quotes. Skip if gas exceeds 8% of the actual position or total costs exceed your budget.`, cost: `up to $${m.gas * m.weeklyTxs} scenario gas for ${m.weeklyTxs} optional transactions`, time: '10 min a week' }
       : { text: `Keep participation checks read-only through week ${m.reviewWeeks} or until exit starts, whichever comes first. Record any published terms and eligibility.`, cost: '$0', time: '10 min a week' };
     return [
-      { text: `Verify ${p.name} lists this route on ${chain}. Set a position size within the $${m.capital} cap. ${m.route.check} Check minimums and quote entry and exit at those amounts. Stay read-only if gas exceeds 8% at that size or total costs exceed your budget.`, cost: '$0', time: '20 min' },
-      { text: `${exitTiming} Confirm official participation terms and your eligibility. Stay read-only if timing or eligibility is unverified.`, cost: '$0', time: '5 min before entry' },
+      { text: `Verify ${p.name} lists this route on ${chain}. Set a size within the $${m.capital} cap. ${m.route.check} Quote entry and exit at those amounts.${m.firstChain && m.firstChain !== chain ? ` If it is not offered there, reprice the plan on ${m.firstChain} before funding.` : ''} Stay read-only if gas exceeds 8% at that size or total costs exceed budget.`, cost: '$0', time: '20 min' },
+      { text: `${exitTiming} Confirm official participation terms and your eligibility. Confirm the wallet holds the position assets and ${chain} gas token, or price the bridge in first. Stay read-only if timing or eligibility is unverified.`, cost: '$0', time: '5 min before entry' },
       { text: `Reserve the quoted exit gas first. Use the position size checked before entry. ${m.route.entry} Save the receipts.`, cost: `up to $${m.gas * m.entryTxs} scenario gas for ${m.entryTxs} transactions incl. approvals`, time: '15 min active, plus settlement if required' },
       ...(followUp ? [followUp] : []),
       { text: `Plan window: ${horizon}. ${m.route.monitor} Recheck exit lead time each review. If it grows, pause optional actions and bring exit forward if possible. Record any rewards shown.`, cost: '$0 gas for read-only checks', time: m.pilot ? '5 min per review' : '5 min weekly' },
@@ -387,11 +404,16 @@
   }
 
   // The page audit: recompute every displayed implied value from the snapshot inputs
-  // with the mirrored model and count disagreements with the stored board values.
+  // with the mirrored model and count disagreements with the stored board values;
+  // then check coverage directly - every slug on the sealed watchlist (carried in
+  // data.js as watchlist_slugs) must be present among the displayed rows.
   function auditValues() {
       var mismatches = 0;
       DATA.rows.forEach(function (r) { if (impliedOf(r) !== r.implied_value_usd) mismatches++; });
-      return { checked: DATA.rows.length, mismatches: mismatches };
+      var present = {};
+      DATA.rows.forEach(function (r) { present[r.slug] = true; });
+      var missing = DATA.watchlist_slugs.filter(function (s) { return !present[s]; });
+      return { checked: DATA.rows.length, mismatches: mismatches, wlTotal: DATA.watchlist_slugs.length, wlMissing: missing.length };
   }
 
   // === end model mirror ===
@@ -407,7 +429,7 @@
     return '<span class="chip verdict-' + v.toLowerCase().replace(' ', '-') + '">' + v + '</span>';
   }
   function statusChip(s) {
-    return s === 'watchlist' ? '<span class="chip chip-watch">Watchlist</span>' : '<span class="chip chip-early">Early</span>';
+    return s === 'watchlist' ? '<span class="chip chip-watch">Watchlist</span>' : '<span class="chip chip-early">Extended</span>';
   }
 
   function headerHTML() {
@@ -417,7 +439,7 @@
       '<p class="sub">Protocols that record no token in the sealed snapshot of ' + esc(DATA.as_of) + ', ranked by an implied value anchored to token-recording peers.</p>' +
       '<div class="accounting" role="note">' +
       '<span><strong>' + a.total + '</strong> protocols in the snapshot</span>' +
-      '<span><strong>' + a.ranked + '</strong> ranked (' + a.watchlist + ' watchlist + ' + a.early + ' early)</span>' +
+      '<span><strong>' + a.ranked + '</strong> ranked (' + a.watchlist + ' watchlist + ' + a.early + ' extended)</span>' +
       '<span><strong>' + a.records_token + '</strong> record a token (Token records view)</span>' +
       '<span><strong>' + a.excluded + '</strong> excluded, each with a reason (Excluded view)</span>' +
       '</div></header>';
@@ -484,14 +506,14 @@
       '<p class="formula">10<sup>' + f.alpha + '</sup> × TVL<sup>' + f.beta + '</sup> × age factor × growth factor</p>' +
       '<p>The size curve is fitted to the ' + v.peers + ' peers with a positive market cap. Age and growth tilt it by at most ' + (100 * TILT) + '% each; the ' + (100 * TILT) + '% amplitude is itself the leave-one-out choice over those peers \u2014 the sweep is nearly flat (tilt \u2192 median error: ' + sweep + '), because age and growth carry almost no transferable signal at ' + v.peers + ' peers, and richer fits score worse on the same test (a ridge regression on standardized size, age and growth: 0.542). Age is neutral at the peer median (' + f.ageAnchor + ' days); growth at 0%. Missing inputs are neutral.</p>' +
       '<p><strong>Token rates are context, never a multiplier.</strong> Each detail view shows its category\u2019s token record rate (snapshot-wide: ' + DATA.accounting.records_token + ' of ' + DATA.accounting.total + '). One snapshot holds no launch history, so that cross-sectional rate cannot be validated as a future issuance probability \u2014 and protocols that have run longest without a token are disproportionately never-launch designs. The ranking uses the peer-fitted conditional value only. The fit\u2019s ' + v.peers + ' peers are a priced, self-selected sample; the test at right inherits that selection.</p>' +
-      '<p class="note audit">Board coverage: the sealed watchlist plus eligible early rows (no symbol, CoinGecko ID or market-cap value; category and name screens passed). Page audit: this page recomputed all ' + audit.checked + ' displayed implied values from the snapshot inputs (impliedOf) \u2014 ' + audit.mismatches + ' mismatches with the stored board.</p></div>' +
+      '<p class="note audit">Board coverage: the sealed watchlist plus eligible extended rows (no symbol, CoinGecko ID or market-cap value; category and name screens passed) \u2014 extended rows are ranked pre-token protocols outside the house watchlist, some larger than watchlist members; the watchlist is the house\u2019s selection, not a size cut, and buildBoard stops the build if a watchlist row is missing. Page audit: this page recomputed all ' + audit.checked + ' displayed implied values from the snapshot inputs (impliedOf) \u2014 ' + audit.mismatches + ' mismatches with the stored board, and coverage: all ' + audit.wlTotal + ' sealed watchlist slugs are present among the displayed rows (' + audit.wlMissing + ' missing).</p></div>' +
       '<div class="validation"><h3>Peer calibration \u00b7 ' + v.peers + ' priced peers</h3>' + calibrationSVG() +
       '<p class="note">Peers (dots) vs the fitted size component (line); band: middle 50% of LOO residuals \u2014 each row\u2019s quoted value range. Squares: five largest watchlist rows.</p>' +
       '<h3>Leave-one-out \u00b7 ' + v.peers + ' token peers</h3>' +
       '<table class="vtable"><thead><tr><th>Model</th><th>Median |log\u2081\u2080 error| \u2193</th><th>Typical miss</th></tr></thead><tbody>' + scores + '</tbody></table>' +
       '<p class="note">Recomputed here from snapshot peers. The test estimates how well the model transfers among token-recording protocols.</p></div>' +
       '</div>' +
-      '<p class="note plans-note">Before funding, confirm eligibility, quote amounts within the cap and verify exit timing. Check the 8% gas limit and total-cost budget. RWA, CDP and Derivatives use short conditional pilots. Weekly actions must fit the gas allowance and total-cost budget after reserving exit. Research plans are read-only. Gas scenarios use $5 per Ethereum transaction and $1 elsewhere. Reward value is unknown.</p></section>';
+      '<p class="note plans-note">Before funding, confirm eligibility, quote amounts within the cap and verify exit timing. Check the 8% gas limit and total-cost budget. RWA, CDP and Derivatives use short conditional pilots. Weekly actions must fit the gas allowance and total-cost budget after reserving exit. Research plans are read-only. Each plan prices its cheapest listed chain; gas scenarios use $5 per Ethereum transaction, $3 on Tron and $1 elsewhere. Reward value is unknown.</p></section>';
   }
 
   function categoriesFor(view) {
@@ -509,7 +531,7 @@
       '<button type="button" data-view="excluded" class="tab" aria-pressed="false">Excluded &amp; why</button></div>' +
       '<label class="search">Search <input id="q" type="search" placeholder="Name, slug or chain" value=""></label>' +
       '<label>Category <select id="cat">' + categoriesFor('board') + '</select></label>' +
-      '<label data-board-filter>Status <select id="status"><option value="all">Watchlist + early</option><option value="watchlist">Watchlist only</option><option value="early">Early only</option></select></label>' +
+      '<label data-board-filter>Status <select id="status"><option value="all">Watchlist + extended</option><option value="watchlist">Watchlist only</option><option value="early">Extended only</option></select></label>' +
       '<label data-board-filter>Plan <select id="verdict"><option value="all">Any plan</option><option>Low gas</option><option>High gas</option><option>Research</option></select></label>' +
       '</div>';
   }
@@ -573,7 +595,7 @@
     var watchlist = rows.filter(r => r.status === 'watchlist').length;
     document.getElementById('board-count').textContent = rows.length + ' of ' + DATA.rows.length + ' ranked protocols · ' +
       watchlist + ' of ' + DATA.accounting.watchlist + ' watchlist · ' +
-      (rows.length - watchlist) + ' of ' + DATA.accounting.early + ' early · Select a protocol for its valuation and plan.';
+      (rows.length - watchlist) + ' of ' + DATA.accounting.early + ' extended · Select a protocol for its valuation and plan.';
     body.querySelectorAll('tr').forEach(function (tr) {
       tr.addEventListener('click', function () { openDetail(tr.getAttribute('data-slug')); });
     });
@@ -649,7 +671,7 @@
       '</tbody></table>' +
       '<h3>' + (fm.pilot ? 'Conditional pilot' : fm.route ? 'Conditional farm plan' : 'Research plan') + '</h3><ol class="steps">' +
       steps.map(function (step) { return '<li>' + esc(step) + '</li>'; }).join('') + '</ol>' +
-      (fm.route ? '<p class="note">The first listed chain is the primary scenario at $' + fm.gas + ' per transaction. Low gas means modeled entry and exit fit within 8% of the position cap. Check total costs separately, including funding, bridging, spread, slippage, funding rates, interest and protocol fees. Reward value is unknown.</p>' : '');
+      (fm.route ? '<p class="note">The priced scenario runs on the cheapest listed chain in the modeled tiers, here at $' + fm.gas + ' per transaction. Low gas means modeled entry and exit fit within 8% of the position cap. Check total costs separately, including funding, bridging, spread, slippage, funding rates, interest and protocol fees. Reward value is unknown.</p>' : '');
     document.body.appendChild(d);
     d.querySelector('.close').addEventListener('click', function () { d.close(); });
     d.addEventListener('click', function (e) { if (e.target === d) d.close(); });
