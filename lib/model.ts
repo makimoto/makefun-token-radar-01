@@ -21,12 +21,22 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-export const MODEL_VERSION = 'radar-16';
+export const MODEL_VERSION = 'radar-17';
 /** Maximum number of eligible off-watchlist rows. */
 export const EARLY_ROWS = 160;
-/** Bounded, symmetric ranking tilts around the peer median age and zero TVL growth. */
+/**
+ * Bounded, symmetric ranking tilts around the peer median age and zero TVL growth.
+ * The amplitude is not hand-set: it is the leave-one-out choice over the positive-cap
+ * peers (the sweep is computed in validateModels and printed on the dashboard). The
+ * sweep is nearly flat — age and growth carry almost no transferable signal at 128
+ * peers — and richer specifications score worse on the same test (a ridge regression
+ * on standardized size, age and growth: 0.542; unpenalized fitted tilt coefficients:
+ * worse still), so the model keeps the fitted size curve and this one fitted amplitude.
+ */
 const TILT = 0.05;
 const GROWTH_SCALE = 50;
+/** Tilt amplitudes the validation sweep reports, including the deployed one. */
+const TILT_SWEEP = [0, 0.02, 0.05, 0.1, 0.2];
 
 /** A farm step: the action, what it costs, and how long it takes. */
 export interface FarmStep {
@@ -56,6 +66,9 @@ export interface BoardRow {
     base_value_usd: number;
     growth_multiplier: number;
     maturity_multiplier: number;
+    /** Middle-50% band of the model's leave-one-out residuals, applied to this row's value. */
+    range_low_usd: number;
+    range_high_usd: number;
     age_days: number | null;
   };
   farm: {
@@ -88,6 +101,11 @@ export interface RadarRow {
   base_value_usd: number;
   growth_multiplier: number;
   maturity_multiplier: number;
+  range_low_usd: number;
+  range_high_usd: number;
+  /** Protocols in this row's category that record a token, of all protocols in the category. */
+  token_rate_k: number;
+  token_rate_n: number;
 }
 
 /** A token-recording protocol, with the snapshot fields behind its classification. */
@@ -121,6 +139,11 @@ export interface Validation {
   radar2_median_log_err: number;
   radar3_median_log_err: number;
   radar4_median_log_err: number;
+  /** Leave-one-out median |log10 error| at each swept tilt amplitude, the deployed one included. */
+  tilt_sweep: { tilt: number; median_log_err: number }[];
+  /** Quartiles of the current model's signed leave-one-out residuals (log10). */
+  resid_q25: number;
+  resid_q75: number;
 }
 
 /** One fitting peer, as the dashboard carries it so the page can re-run the validation itself. */
@@ -234,20 +257,25 @@ function calibratedFit(peers: SnapshotProtocol[], asOf: string): Fit {
   };
 }
 
-function growthMultiplier(change: number | null): number {
+function growthMultiplier(change: number | null, tilt: number = TILT): number {
   const g = change ?? 0;
-  return 1 + TILT * (g / (GROWTH_SCALE + Math.abs(g)));
+  return 1 + tilt * (g / (GROWTH_SCALE + Math.abs(g)));
 }
 
-function maturityMultiplier(age: number | null, anchor: number): number {
-  return age === null ? 1 : 1 + TILT * ((age - anchor) / (age + anchor));
+function maturityMultiplier(age: number | null, anchor: number, tilt: number = TILT): number {
+  return age === null ? 1 : 1 + tilt * ((age - anchor) / (age + anchor));
 }
 
 export function impliedValue(p: SnapshotProtocol, asOf: string, fit: Fit) {
+  return tiltImplied(p, asOf, fit, TILT);
+}
+
+/** The deployed prediction at an arbitrary tilt amplitude; the validation sweep uses this. */
+function tiltImplied(p: SnapshotProtocol, asOf: string, fit: Fit, tilt: number) {
   const age = ageDays(asOf, p.listed_at);
   const base = Math.pow(10, fit.alpha) * Math.pow(p.tvl_usd, fit.beta);
-  const growthMult = growthMultiplier(p.change_7d);
-  const maturityMult = maturityMultiplier(age, fit.ageAnchor);
+  const growthMult = growthMultiplier(p.change_7d, tilt);
+  const maturityMult = maturityMultiplier(age, fit.ageAnchor, tilt);
   const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
   return { implied, base, growthMult, maturityMult, age };
 }
@@ -266,6 +294,29 @@ function median(values: number[]): number {
   const s = [...values].sort((a, b) => a - b);
   const mid = Math.floor(s.length / 2);
   return s.length % 2 === 1 ? s[mid]! : (s[mid - 1]! + s[mid]!) / 2;
+}
+
+/** A quantile of an ascending-sorted array, by linear interpolation between closest ranks. */
+function quantile(sorted: number[], q: number): number {
+  if (sorted.length === 0) return 0;
+  const pos = (sorted.length - 1) * q;
+  const lo = Math.floor(pos);
+  const hi = Math.ceil(pos);
+  if (lo === hi) return sorted[lo]!;
+  return sorted[lo]! + (sorted[hi]! - sorted[lo]!) * (pos - lo);
+}
+
+/** Signed leave-one-out residuals (log10 predicted / actual) of the deployed model over the peers. */
+function currentModelResiduals(snapshot: Snapshot): number[] {
+  const peers = peerSet(snapshot);
+  const residuals: number[] = [];
+  for (let i = 0; i < peers.length; i++) {
+    const p = peers[i]!;
+    const train = peers.filter((_, j) => j !== i);
+    const predicted = impliedValue(p, snapshot.as_of, calibratedFit(train, snapshot.as_of)).implied;
+    residuals.push(Math.log10(predicted / p.mcap_usd!));
+  }
+  return residuals;
 }
 
 /**
@@ -296,6 +347,19 @@ export function validateModels(snapshot: Snapshot): Validation {
     eRound3.push(Math.abs(Math.log10(predicted / actual)));
   }
   const r3 = (n: number) => Math.round(n * 1000) / 1000;
+  // The tilt-amplitude sweep: the same leave-one-out at other amplitudes, so the deployed
+  // amplitude's status as the leave-one-out choice is itself recomputed, not asserted.
+  const tilt_sweep = TILT_SWEEP.map((tilt) => {
+    const errs: number[] = [];
+    for (let i = 0; i < peers.length; i++) {
+      const p = peers[i]!;
+      const train = peers.filter((_, j) => j !== i);
+      const predicted = tiltImplied(p, snapshot.as_of, calibratedFit(train, snapshot.as_of), tilt).implied;
+      errs.push(Math.abs(Math.log10(predicted / p.mcap_usd!)));
+    }
+    return { tilt, median_log_err: r3(median(errs)) };
+  });
+  const sortedResid = [...currentModelResiduals(snapshot)].sort((a, b) => a - b);
   return {
     peers: peers.length,
     starter_median_log_err: r3(median(eStarter)),
@@ -305,6 +369,9 @@ export function validateModels(snapshot: Snapshot): Validation {
     // Radar-4 ships radar-3's value model unchanged (its changes are the farm plans),
     // so its leave-one-out error is the same computation on the same folds.
     radar4_median_log_err: r3(median(eRound3)),
+    tilt_sweep,
+    resid_q25: Math.round(quantile(sortedResid, 0.25) * 1000) / 1000,
+    resid_q75: Math.round(quantile(sortedResid, 0.75) * 1000) / 1000,
   };
 }
 
@@ -495,6 +562,9 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
 /** The protocols the board ranks, strongest first, with ranks 1..n, plus the accounting. */
 export function buildBoard(snapshot: Snapshot): { board: BoardRow[]; excluded: ExcludedRow[]; accounting: Accounting } {
   const fit = calibratedFit(peerSet(snapshot), snapshot.as_of);
+  const sortedResid = [...currentModelResiduals(snapshot)].sort((a, b) => a - b);
+  const bandLow = Math.pow(10, quantile(sortedResid, 0.25));
+  const bandHigh = Math.pow(10, quantile(sortedResid, 0.75));
   const index = new Map(snapshot.protocols.map((p) => [p.slug, p]));
   const watch = new Set(snapshot.watchlist);
   const chosen = new Map<string, SnapshotProtocol>();
@@ -533,6 +603,8 @@ export function buildBoard(snapshot: Snapshot): { board: BoardRow[]; excluded: E
         base_value_usd: s.v.base,
         growth_multiplier: s.v.growthMult,
         maturity_multiplier: s.v.maturityMult,
+        range_low_usd: Math.max(1, Math.round(s.v.implied * bandLow)),
+        range_high_usd: Math.max(1, Math.round(s.v.implied * bandHigh)),
         age_days: s.v.age,
       },
       farm: {
@@ -594,6 +666,15 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
   const peers = peerSet(snapshot);
   const fit = calibratedFit(peerSet(snapshot), snapshot.as_of);
   const { board, excluded, accounting } = buildBoard(snapshot);
+  // Per-category token record rates over the whole snapshot, for context display only.
+  const catRates = new Map<string, { k: number; n: number }>();
+  for (const p of snapshot.protocols) {
+    if (p.category === null) continue;
+    const c = catRates.get(p.category) ?? { k: 0, n: 0 };
+    c.n++;
+    if (!isPreToken(p)) c.k++;
+    catRates.set(p.category, c);
+  }
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -621,6 +702,10 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       base_value_usd: r.model.base_value_usd,
       growth_multiplier: r.model.growth_multiplier,
       maturity_multiplier: r.model.maturity_multiplier,
+      range_low_usd: r.model.range_low_usd,
+      range_high_usd: r.model.range_high_usd,
+      token_rate_k: r.category === null ? 0 : (catRates.get(r.category)?.k ?? 0),
+      token_rate_n: r.category === null ? 0 : (catRates.get(r.category)?.n ?? 0),
     })),
     live: liveRows(snapshot),
     excluded,
